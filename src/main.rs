@@ -113,21 +113,31 @@ fn send_icmp_unreachable(
     ipv4_packet.set_next_level_protocol(pnet::packet::ip::IpNextHeaderProtocols::Icmp);
     ipv4_packet.set_source(original_dst_ip);
     ipv4_packet.set_destination(original_src_ip);
-    ipv4_packet.set_checksum(0);
-    ipv4_packet.set_checksum(util::checksum(ipv4_packet.packet(), 1));
+    
+    // 修复：手动复制 ICMP 数据到 IPv4 的 payload 区域
+    ipv4_buf[20..20 + icmp_packet.packet().len()].copy_from_slice(icmp_packet.packet());
+    
+    // 重新创建 packet 以确保数据正确
+    let mut ipv4_packet = MutableIpv4Packet::new(&mut ipv4_buf).unwrap();
+    let checksum = util::checksum(ipv4_packet.packet(), 5);
+    ipv4_packet.set_checksum(checksum);
 
     // 4. 创建以太网帧
-    let mut eth_buf = vec![0u8; 14 + ipv4_packet.packet().len()];
+    let mut eth_buf = vec![0u8; 14 + ipv4_buf.len()];
     let mut eth_packet = MutableEthernetPacket::new(&mut eth_buf).unwrap();
     eth_packet.set_ethertype(EtherTypes::Ipv4);
     eth_packet.set_source(src_mac);
     eth_packet.set_destination(dst_mac);
-    eth_packet.set_payload(ipv4_packet.packet());
+    
+    // 修复：手动复制 IPv4 数据到以太网帧的 payload 区域
+    eth_buf[14..14 + ipv4_buf.len()].copy_from_slice(&ipv4_buf);
 
     // 5. 发送
-    match tx.send_to(eth_packet.packet(), None) {
-        Some(Ok(_)) => println!("发送 ICMP 端口不可达: {}:{} -> {}", original_dst_ip, tcp_packet.get_destination(), original_src_ip),
-        Some(Err(e)) => eprintln!("发送失败: {:?}", e),
-        None => eprintln!("发送失败: 无数据"),
+    match tx.send_to(&eth_buf, None) {
+        Some(Ok(_)) => println!("✓ 发送 ICMP 端口不可达: {}:{} -> {}:{}", 
+            original_src_ip, tcp_packet.get_source(),
+            original_dst_ip, tcp_packet.get_destination()),
+        Some(Err(e)) => eprintln!("✗ 发送失败: {:?}", e),
+        None => eprintln!("✗ 发送失败: 无数据"),
     }
 }
