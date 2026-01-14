@@ -1,10 +1,14 @@
 use pnet::datalink::{self, NetworkInterface, DataLinkSender, DataLinkReceiver};
 use pnet::datalink::Channel::Ethernet;
 use pnet::packet::{Packet};
-use pnet::packet::ethernet::{EthernetPacket};
-use pnet::packet::ipv4::{Ipv4Packet};
+use pnet::packet::ethernet::{EthernetPacket, MutableEthernetPacket, EtherTypes};
+use pnet::packet::ipv4::{Ipv4Packet, MutableIpv4Packet};
 use pnet::packet::tcp::TcpPacket;
+use pnet::packet::icmp::{IcmpType, IcmpCode};
+use pnet::packet::icmp::destination_unreachable::MutableDestinationUnreachablePacket;
+use pnet::util;
 use std::env;
+use std::net::Ipv4Addr;
 
 fn main() {
     let interface_name = env::args().nth(1).unwrap_or_else(|| "eth0".to_string());
@@ -46,7 +50,7 @@ fn start_capture(tx: &mut Box<dyn DataLinkSender>, rx: &mut Box<dyn DataLinkRece
 fn process_packet(tx: &mut Box<dyn DataLinkSender>, packet: &[u8]) {
     let eth_packet = EthernetPacket::new(packet).unwrap();
 
-    if eth_packet.get_ethertype() != pnet::packet::ethernet::EtherTypes::Ipv4 {
+    if eth_packet.get_ethertype() != EtherTypes::Ipv4 {
         return;
     }
 
@@ -54,20 +58,76 @@ fn process_packet(tx: &mut Box<dyn DataLinkSender>, packet: &[u8]) {
         Some(p) => p,
         None => return,
     };
-    let src_ip = ip_packet.get_source();
-    let dst_ip = ip_packet.get_destination();
 
     if ip_packet.get_next_level_protocol() != pnet::packet::ip::IpNextHeaderProtocols::Tcp {
         return;
     }
 
+    let src_mac = eth_packet.get_source();
+    let dst_mac = eth_packet.get_destination();
+    let src_ip = ip_packet.get_source();
+    let dst_ip = ip_packet.get_destination();
+
     let tcp_packet = match TcpPacket::new(ip_packet.payload()) {
         Some(p) => p,
         None => return,
     };
-    let src_port = tcp_packet.get_source();
-    let dst_port = tcp_packet.get_destination();
 
-    println!("[TCP] {}:{} -> {}:{}",
-        src_ip, src_port, dst_ip, dst_port);
+    send_icmp_unreachable(tx, src_ip, dst_ip, dst_mac, src_mac, &ip_packet, &tcp_packet);
+}
+
+// ICMP Type 3: Destination Unreachable
+// ICMP Code 3: Port Unreachable
+fn send_icmp_unreachable(
+    tx: &mut Box<dyn DataLinkSender>,
+    original_src_ip: Ipv4Addr,
+    original_dst_ip: Ipv4Addr,
+    src_mac: pnet::util::MacAddr,
+    dst_mac: pnet::util::MacAddr,
+    ip_packet: &Ipv4Packet,
+    tcp_packet: &TcpPacket,
+) {
+    // 1. 准备 ICMP payload：原始 IP 头 + TCP 头前 8 字节
+    let ip_header_len = ip_packet.get_header_length() as usize * 4;
+    let mut icmp_payload = Vec::new();
+    icmp_payload.extend_from_slice(&ip_packet.packet()[..ip_header_len]);
+    icmp_payload.extend_from_slice(&tcp_packet.packet()[..8.min(tcp_packet.packet().len())]);
+
+    // 2. 创建 ICMP 不可达包
+    let icmp_header_size = 8;
+    let mut icmp_buf = vec![0u8; icmp_header_size + icmp_payload.len()];
+    let mut icmp_packet = MutableDestinationUnreachablePacket::new(&mut icmp_buf).unwrap();
+    icmp_packet.set_icmp_type(IcmpType(3));
+    icmp_packet.set_icmp_code(IcmpCode(3));
+    icmp_packet.set_payload(&icmp_payload);
+    icmp_packet.set_checksum(0);
+    icmp_packet.set_checksum(util::checksum(icmp_packet.packet(), 1));
+
+    // 3. 创建 IPv4 包
+    let mut ipv4_buf = vec![0u8; 20 + icmp_packet.packet().len()];
+    let mut ipv4_packet = MutableIpv4Packet::new(&mut ipv4_buf).unwrap();
+    ipv4_packet.set_version(4);
+    ipv4_packet.set_header_length(5);
+    ipv4_packet.set_total_length((20 + icmp_packet.packet().len()) as u16);
+    ipv4_packet.set_ttl(64);
+    ipv4_packet.set_next_level_protocol(pnet::packet::ip::IpNextHeaderProtocols::Icmp);
+    ipv4_packet.set_source(original_dst_ip);
+    ipv4_packet.set_destination(original_src_ip);
+    ipv4_packet.set_checksum(0);
+    ipv4_packet.set_checksum(util::checksum(ipv4_packet.packet(), 1));
+
+    // 4. 创建以太网帧
+    let mut eth_buf = vec![0u8; 14 + ipv4_packet.packet().len()];
+    let mut eth_packet = MutableEthernetPacket::new(&mut eth_buf).unwrap();
+    eth_packet.set_ethertype(EtherTypes::Ipv4);
+    eth_packet.set_source(src_mac);
+    eth_packet.set_destination(dst_mac);
+    eth_packet.set_payload(ipv4_packet.packet());
+
+    // 5. 发送
+    match tx.send_to(eth_packet.packet(), None) {
+        Some(Ok(_)) => println!("发送 ICMP 端口不可达: {}:{} -> {}", original_dst_ip, tcp_packet.get_destination(), original_src_ip),
+        Some(Err(e)) => eprintln!("发送失败: {:?}", e),
+        None => eprintln!("发送失败: 无数据"),
+    }
 }
