@@ -1,4 +1,4 @@
-use pnet::datalink::{self, NetworkInterface, DataLinkSender};
+use pnet::datalink::{self, NetworkInterface, DataLinkSender, DataLinkReceiver};
 use pnet::datalink::Channel::Ethernet;
 use pnet::packet::{Packet};
 use pnet::packet::ethernet::{EthernetPacket};
@@ -24,7 +24,7 @@ fn find_interface(name: &str) -> NetworkInterface {
         .expect(&format!("网卡 {} 不存在", name))
 }
 
-fn create_channel(interface: &NetworkInterface) -> (Box<dyn DataLinkSender>, Box<dyn std::io::Read>) {
+fn create_channel(interface: &NetworkInterface) -> (Box<dyn DataLinkSender>, Box<dyn DataLinkReceiver>) {
     match datalink::channel(interface, Default::default()) {
         Ok(Ethernet(tx, rx)) => (tx, rx),
         Ok(_) => panic!("不支持的通道类型"),
@@ -32,7 +32,7 @@ fn create_channel(interface: &NetworkInterface) -> (Box<dyn DataLinkSender>, Box
     }
 }
 
-fn start_capture(tx: &mut Box<dyn DataLinkSender>, rx: &mut Box<dyn std::io::Read>) {
+fn start_capture(tx: &mut Box<dyn DataLinkSender>, rx: &mut Box<dyn DataLinkReceiver>) {
     loop {
         match rx.next() {
             Ok(packet) => {
@@ -50,7 +50,10 @@ fn process_packet(tx: &mut Box<dyn DataLinkSender>, packet: &[u8]) {
         return;
     }
 
-    let ip_packet = Ipv4Packet::new(eth_packet.payload())?;
+    let ip_packet = match Ipv4Packet::new(eth_packet.payload()) {
+        Some(p) => p,
+        None => return,
+    };
     let src_ip = ip_packet.get_source();
     let dst_ip = ip_packet.get_destination();
 
@@ -58,7 +61,10 @@ fn process_packet(tx: &mut Box<dyn DataLinkSender>, packet: &[u8]) {
         return;
     }
 
-    let tcp_packet = TcpPacket::new(ip_packet.payload())?;
+    let tcp_packet = match TcpPacket::new(ip_packet.payload()) {
+        Some(p) => p,
+        None => return,
+    };
     let src_port = tcp_packet.get_source();
     let dst_port = tcp_packet.get_destination();
 
